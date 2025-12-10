@@ -1,7 +1,3 @@
-# live_hybrid_fusion_realtime.py
-# Live video annotation for HYBRID FUSION model
-# Optimized for Elgato HD60 X capture card with Hybrid Cross Fusion architecture
-
 import os
 
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
@@ -26,7 +22,7 @@ import gc
 cv2.setNumThreads(2)
 
 # Import model components
-from train_hybrid_production import (
+from train_DentScanNet import (
     HybridCrossFusion as _HybridCrossFusion,
     build_hybrid_fusion_model,
     ALL_FEATURES,
