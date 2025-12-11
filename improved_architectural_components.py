@@ -2,9 +2,6 @@ import tensorflow as tf
 from tensorflow.keras import layers
 
 
-# ============================================================================
-# IMPROVED PYRAMID POOLING LAYERS
-# ============================================================================
 
 class SelectivePyramidPooling(layers.Layer):
     """
@@ -475,4 +472,5 @@ if __name__ == '__main__':
     print("  • AdaptiveCrossFusion: Learnable fusion weight (starts at 0.1)")
     print("  • TaskAwareCrossFusion: Asymmetric weights (0.1 detail, 0.5 semantic)")
     print("  • attention_gated_fusion: Spatially-adaptive attention gates")
+
     print("-"*80)
