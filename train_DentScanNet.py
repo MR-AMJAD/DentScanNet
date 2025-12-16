@@ -147,17 +147,17 @@ def online_hard_example_mining_focal_loss(y_true, y_pred, gamma=2.0, alpha=0.25,
 def soft_argmax_2d(heatmap):
     """
     FIXED: Differentiable soft-argmax with proper dtype handling
+    NORMALIZED: Returns coordinates in [0, 1] range for stable Huber loss
     
-    Key fix: Cast coordinate grids to match input dtype (FP16 or FP32)
+    Key fixes:
+    1. Cast coordinate grids to match input dtype (FP16 or FP32)
+    2. Normalize coordinates to [0, 1] to prevent explosive loss values
     """
     if len(heatmap.shape) == 4:
         if heatmap.shape[-1] == 2:
             heatmap = heatmap[..., 1]  # Extract foreground
         else:
             heatmap = tf.squeeze(heatmap, axis=-1)
-    
-    # Get input dtype (will be float16 with mixed precision)
-    input_dtype = heatmap.dtype
     
     batch_size = tf.shape(heatmap)[0]
     height = tf.shape(heatmap)[1]
@@ -181,9 +181,17 @@ def soft_argmax_2d(heatmap):
     x_pred = tf.reduce_sum(weights * x_grid, axis=[1, 2])
     y_pred = tf.reduce_sum(weights * y_grid, axis=[1, 2])
     
-    coords = tf.stack([x_pred, y_pred], axis=1)
+    # CRITICAL: Normalize to [0, 1] for stable loss computation
+    # This prevents coordinate losses from exploding (70-80 → 0.1-0.5)
+    width_f32 = tf.cast(width, tf.float32)
+    height_f32 = tf.cast(height, tf.float32)
     
-    # Keep in float32 for coordinate regression (Huber loss expects float32)
+    x_pred_norm = x_pred / width_f32   # 0-256 → 0-1
+    y_pred_norm = y_pred / height_f32  # 0-256 → 0-1
+    
+    coords = tf.stack([x_pred_norm, y_pred_norm], axis=1)
+    
+    # Return normalized float32 coordinates for Huber loss
     return coords
 
 
@@ -343,9 +351,7 @@ class HybridCrossFusion(layers.Layer):
 
 def build_complete_manuscript_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
                                    spatial_reduction=8, channel_reduction=4):
-    """Build COMPLETE manuscript-consistent model with dtype fix"""
-    
-        
+       
     inputs = layers.Input(input_shape, name='input')
     
     # ========== STEM ==========
@@ -481,7 +487,6 @@ def build_complete_manuscript_model(input_shape=(256, 256, 3), features=ALL_FEAT
     
     for i, name in enumerate(output_names):
         model.output_names[i] = name
-    
 
     
     return model, output_names
@@ -575,7 +580,10 @@ class ManuscriptConsistentDataLoader:
     
     @staticmethod
     def extract_coordinates_from_mask(mask):
-        """Extract centroid from mask (returns FP32)"""
+        """
+        Extract centroid from mask (returns normalized FP32 coordinates)
+        NORMALIZED: Returns coordinates in [0, 1] range to match soft_argmax
+        """
         if len(mask.shape) == 4 and mask.shape[-1] == 2:
             mask = mask[..., 1]
         
@@ -596,7 +604,14 @@ class ManuscriptConsistentDataLoader:
         x_center = tf.reduce_sum(mask * x_grid, axis=[1, 2]) / total_mass
         y_center = tf.reduce_sum(mask * y_grid, axis=[1, 2]) / total_mass
         
-        coords = tf.stack([x_center, y_center], axis=1)
+        # CRITICAL: Normalize to [0, 1] to match soft_argmax output
+        width_f32 = tf.cast(width, tf.float32)
+        height_f32 = tf.cast(height, tf.float32)
+        
+        x_center_norm = x_center / width_f32   # 0-256 → 0-1
+        y_center_norm = y_center / height_f32  # 0-256 → 0-1
+        
+        coords = tf.stack([x_center_norm, y_center_norm], axis=1)
         
         return coords
 
@@ -610,7 +625,8 @@ def train_complete_manuscript_model(data_dir, output_dir, epochs=30, batch_size=
                                    spatial_reduction=8, channel_reduction=4,
                                    loss_weights=None):
     """Train with COMPLETE manuscript-consistent implementation (FIXED)"""
-
+    
+ 
     
     np.random.seed(seed)
     tf.random.set_seed(seed)
@@ -645,7 +661,9 @@ def train_complete_manuscript_model(data_dir, output_dir, epochs=30, batch_size=
         metrics=metrics
     )
     
-
+    print("\nModel compiled (dtype fix applied)")
+    print("  FP16: masks and heatmaps")
+    print("  FP32: coordinates (for Huber loss stability)")
     
     # Data loaders
     train_path = os.path.join(data_dir, 'train')
@@ -773,7 +791,6 @@ def main():
     print("\n" + "="*80)
     print("COMPLETE MANUSCRIPT-CONSISTENT TRAINING (DTYPE FIXED)")
     print("="*80)
-    print(f"Fix applied: Mixed precision dtype handling in soft_argmax")
     print(f"Data: {args.data_dir}")
     print(f"Output: {args.output_dir}")
     print("="*80)
