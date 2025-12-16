@@ -1,3 +1,4 @@
+
 import os
 import argparse
 import json
@@ -11,7 +12,6 @@ import time
 from standalone_production_training import (
     stable_reparameterizable_block,
     ssm_v1_original,
-    create_optimized_feature_heads,
     OptimizedDataLoader,
     ALL_FEATURES,
     POINT_FEATURES,
@@ -19,10 +19,8 @@ from standalone_production_training import (
     IMAGE_HEIGHT,
     IMAGE_WIDTH,
     NUM_CLASSES,
-    dice_coefficient_metric,
 )
 
-# Import improved components
 from improved_architectural_components import (
     SelectivePyramidPooling,
 )
@@ -30,24 +28,209 @@ from improved_architectural_components import (
 mixed_precision.set_global_policy('mixed_float16')
 
 
+# ============================================================================
+# LOSS FUNCTIONS (same as before)
+# ============================================================================
+
+def dice_loss(y_true, y_pred, smooth=1e-6):
+    """Standard Dice loss"""
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    if len(y_true.shape) > 3 and y_true.shape[-1] == 2:
+        y_true = y_true[..., 1]
+        y_pred = y_pred[..., 1]
+    
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+    
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f)
+    
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return 1.0 - dice
+
+
+def tversky_loss(y_true, y_pred, alpha=0.3, beta=0.7, smooth=1e-6):
+    """Tversky loss"""
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    if len(y_true.shape) > 3 and y_true.shape[-1] == 2:
+        y_true = y_true[..., 1]
+        y_pred = y_pred[..., 1]
+    
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+    
+    true_pos = tf.reduce_sum(y_true_f * y_pred_f)
+    false_pos = tf.reduce_sum((1 - y_true_f) * y_pred_f)
+    false_neg = tf.reduce_sum(y_true_f * (1 - y_pred_f))
+    
+    tversky_index = (true_pos + smooth) / (true_pos + alpha * false_pos + beta * false_neg + smooth)
+    
+    return 1.0 - tversky_index
+
+
+def focal_tversky_loss(y_true, y_pred, alpha=0.3, beta=0.7, gamma=1.5, smooth=1e-6):
+    """Focal Tversky loss"""
+    tversky = tversky_loss(y_true, y_pred, alpha=alpha, beta=beta, smooth=smooth)
+    focal_tversky = tf.pow(tversky, gamma)
+    return focal_tversky
+
+
+def hybrid_dice_tversky_loss(y_true, y_pred, alpha=0.3, beta=0.7, gamma=1.5):
+    """Hybrid Dice-Tversky loss (Equation 12)"""
+    dice = dice_loss(y_true, y_pred)
+    focal_tversky = focal_tversky_loss(y_true, y_pred, alpha=alpha, beta=beta, gamma=gamma)
+    hybrid = 0.5 * dice + 0.5 * focal_tversky
+    return hybrid
+
+
+def focal_binary_crossentropy(y_true, y_pred, gamma=2.0, alpha=0.25):
+    """Focal loss"""
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    if len(y_true.shape) > 3 and y_true.shape[-1] == 2:
+        y_true = y_true[..., 1]
+        y_pred = y_pred[..., 1]
+    
+    epsilon = tf.keras.backend.epsilon()
+    y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+    
+    bce = - (y_true * tf.math.log(y_pred) + (1 - y_true) * tf.math.log(1 - y_pred))
+    p_t = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
+    focal_weight = tf.pow(1 - p_t, gamma)
+    alpha_t = tf.where(tf.equal(y_true, 1), alpha, 1 - alpha)
+    focal_loss = alpha_t * focal_weight * bce
+    
+    return tf.reduce_mean(focal_loss)
+
+
+def online_hard_example_mining_focal_loss(y_true, y_pred, gamma=2.0, alpha=0.25, 
+                                          ohem_ratio=0.25, min_kept=100):
+    """Focal loss with OHEM (Equation 13)"""
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    if len(y_true.shape) > 3 and y_true.shape[-1] == 2:
+        y_true = y_true[..., 1]
+        y_pred = y_pred[..., 1]
+    
+    batch_size = tf.shape(y_true)[0]
+    
+    y_true_flat = tf.reshape(y_true, [batch_size, -1])
+    y_pred_flat = tf.reshape(y_pred, [batch_size, -1])
+    
+    epsilon = tf.keras.backend.epsilon()
+    y_pred_flat = tf.clip_by_value(y_pred_flat, epsilon, 1.0 - epsilon)
+    
+    bce = - (y_true_flat * tf.math.log(y_pred_flat) + (1 - y_true_flat) * tf.math.log(1 - y_pred_flat))
+    p_t = tf.where(tf.equal(y_true_flat, 1), y_pred_flat, 1 - y_pred_flat)
+    focal_weight = tf.pow(1 - p_t, gamma)
+    alpha_t = tf.where(tf.equal(y_true_flat, 1), alpha, 1 - alpha)
+    per_pixel_loss = alpha_t * focal_weight * bce
+    
+    num_pixels = tf.shape(per_pixel_loss)[1]
+    num_keep = tf.maximum(
+        tf.cast(tf.cast(num_pixels, tf.float32) * ohem_ratio, tf.int32),
+        min_kept
+    )
+    
+    top_k_losses, _ = tf.nn.top_k(per_pixel_loss, k=num_keep, sorted=False)
+    ohem_loss = tf.reduce_mean(top_k_losses)
+    
+    return ohem_loss
+
+
+def soft_argmax_2d(heatmap):
+    """
+    FIXED: Differentiable soft-argmax with proper dtype handling
+    
+    Key fix: Cast coordinate grids to match input dtype (FP16 or FP32)
+    """
+    if len(heatmap.shape) == 4:
+        if heatmap.shape[-1] == 2:
+            heatmap = heatmap[..., 1]  # Extract foreground
+        else:
+            heatmap = tf.squeeze(heatmap, axis=-1)
+    
+    # Get input dtype (will be float16 with mixed precision)
+    input_dtype = heatmap.dtype
+    
+    batch_size = tf.shape(heatmap)[0]
+    height = tf.shape(heatmap)[1]
+    width = tf.shape(heatmap)[2]
+    
+    heatmap_flat = tf.reshape(heatmap, [batch_size, height * width])
+    
+    # Softmax in float32 for numerical stability
+    heatmap_flat_f32 = tf.cast(heatmap_flat, tf.float32)
+    weights = tf.nn.softmax(heatmap_flat_f32, axis=1)
+    weights = tf.reshape(weights, [batch_size, height, width])
+    
+    # Create coordinate grids in float32
+    x_coords = tf.range(width, dtype=tf.float32)
+    y_coords = tf.range(height, dtype=tf.float32)
+    
+    x_grid = tf.tile(tf.reshape(x_coords, [1, 1, width]), [batch_size, height, 1])
+    y_grid = tf.tile(tf.reshape(y_coords, [1, height, 1]), [batch_size, 1, width])
+    
+    # Compute weighted average (all in float32)
+    x_pred = tf.reduce_sum(weights * x_grid, axis=[1, 2])
+    y_pred = tf.reduce_sum(weights * y_grid, axis=[1, 2])
+    
+    coords = tf.stack([x_pred, y_pred], axis=1)
+    
+    # Keep in float32 for coordinate regression (Huber loss expects float32)
+    return coords
+
+
+def huber_coordinate_loss(y_true, y_pred, delta=1.0):
+    """Huber loss for coordinates (Equation 14)"""
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    
+    error = tf.abs(y_true - y_pred)
+    
+    quadratic = 0.5 * tf.square(error)
+    linear = delta * (error - 0.5 * delta)
+    
+    huber = tf.where(error <= delta, quadratic, linear)
+    
+    loss = tf.reduce_mean(tf.reduce_sum(huber, axis=1))
+    
+    return loss
 
 
 # ============================================================================
-# HYBRID FUSION LAYER
+# COORDINATE EXTRACTOR LAYER (FIXED)
+# ============================================================================
+
+class SoftArgmaxCoordinateExtractor(layers.Layer):
+    """
+    FIXED: Extracts coordinates with proper dtype handling
+    Output is always float32 (for Huber loss)
+    """
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+    
+    def call(self, heatmap):
+        # soft_argmax_2d handles dtype internally and returns float32
+        return soft_argmax_2d(heatmap)
+    
+    def get_config(self):
+        return super().get_config()
+
+
+# ============================================================================
+# HYBRID FUSION (unchanged)
 # ============================================================================
 
 class HybridCrossFusion(layers.Layer):
-    """
-    Hybrid Cross Fusion: Spatial Attention + Channel Gating
-    
-    Combines both WHERE (spatial) and WHAT (channels) to fuse.
-    Best performing fusion strategy based on comprehensive evaluation.
-    
-    Args:
-        spatial_reduction: Reduction ratio for spatial attention (default: 8)
-        channel_reduction: Reduction ratio for channel gating (default: 4)
-        use_residual: Add residual connection (default: True)
-    """
+    """Hybrid Cross Fusion: Spatial Attention + Channel Gating"""
     
     def __init__(self, spatial_reduction=8, channel_reduction=4, 
                  use_residual=True, **kwargs):
@@ -67,8 +250,7 @@ class HybridCrossFusion(layers.Layer):
         semantic_up_filters = semantic_up_shape[-1]
         detail_down_filters = detail_down_shape[-1]
         
-        # ===== DETAIL BRANCH =====
-        # Spatial attention
+        # Detail branch
         self.detail_spatial_conv1 = layers.Conv2D(
             filters=max(8, detail_filters // self.spatial_reduction),
             kernel_size=3, padding='same', activation='relu',
@@ -78,8 +260,6 @@ class HybridCrossFusion(layers.Layer):
             filters=1, kernel_size=1, padding='same', activation='sigmoid',
             kernel_initializer='glorot_uniform', name='detail_spatial_conv2'
         )
-        
-        # Channel gating
         self.detail_gap = layers.GlobalAveragePooling2D(name='detail_gap')
         self.detail_channel_fc1 = layers.Dense(
             units=max(8, (detail_filters + semantic_up_filters) // self.channel_reduction),
@@ -91,8 +271,7 @@ class HybridCrossFusion(layers.Layer):
             kernel_initializer='glorot_uniform', name='detail_channel_fc2'
         )
         
-        # ===== SEMANTIC BRANCH =====
-        # Spatial attention
+        # Semantic branch
         self.semantic_spatial_conv1 = layers.Conv2D(
             filters=max(8, semantic_filters // self.spatial_reduction),
             kernel_size=3, padding='same', activation='relu',
@@ -102,8 +281,6 @@ class HybridCrossFusion(layers.Layer):
             filters=1, kernel_size=1, padding='same', activation='sigmoid',
             kernel_initializer='glorot_uniform', name='semantic_spatial_conv2'
         )
-        
-        # Channel gating
         self.semantic_gap = layers.GlobalAveragePooling2D(name='semantic_gap')
         self.semantic_channel_fc1 = layers.Dense(
             units=max(8, (semantic_filters + detail_down_filters) // self.channel_reduction),
@@ -120,20 +297,13 @@ class HybridCrossFusion(layers.Layer):
     def call(self, inputs, training=None):
         detail, semantic, semantic_up, detail_down = inputs
         
-        # ===== DETAIL BRANCH =====
         detail_context = layers.Concatenate()([detail, semantic_up])
-        
-        # Spatial attention
         spatial_attn = self.detail_spatial_conv1(detail_context)
         spatial_attn = self.detail_spatial_conv2(spatial_attn)
-        
-        # Channel gating
         channel_context = self.detail_gap(detail_context)
         channel_gate = self.detail_channel_fc1(channel_context)
         channel_gate = self.detail_channel_fc2(channel_gate)
         channel_gate = layers.Reshape((1, 1, -1))(channel_gate)
-        
-        # Combined attention: spatial * channel
         combined_attn = spatial_attn * channel_gate
         
         if self.use_residual:
@@ -141,17 +311,13 @@ class HybridCrossFusion(layers.Layer):
         else:
             detail_fused = detail * (1 - combined_attn) + combined_attn * semantic_up
         
-        # ===== SEMANTIC BRANCH =====
         semantic_context = layers.Concatenate()([semantic, detail_down])
-        
         spatial_attn = self.semantic_spatial_conv1(semantic_context)
         spatial_attn = self.semantic_spatial_conv2(spatial_attn)
-        
         channel_context = self.semantic_gap(semantic_context)
         channel_gate = self.semantic_channel_fc1(channel_context)
         channel_gate = self.semantic_channel_fc2(channel_gate)
         channel_gate = layers.Reshape((1, 1, -1))(channel_gate)
-        
         combined_attn = spatial_attn * channel_gate
         
         if self.use_residual:
@@ -172,39 +338,14 @@ class HybridCrossFusion(layers.Layer):
 
 
 # ============================================================================
-# MODEL ARCHITECTURE - HYBRID FUSION PRODUCTION
+# MODEL ARCHITECTURE (same structure, uses fixed SoftArgmax)
 # ============================================================================
 
-def build_hybrid_fusion_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
-                               spatial_reduction=8, channel_reduction=4):
-    """
-    Build the production Hybrid Fusion model
+def build_complete_manuscript_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
+                                   spatial_reduction=8, channel_reduction=4):
+    """Build COMPLETE manuscript-consistent model with dtype fix"""
     
-    Architecture:
-    - Stem: 32 filters, stride 2
-    - Detail Branch: 32 filters, 2 reparam blocks
-    - Semantic Branch: 64→96 filters, SSM, Selective Pyramid
-    - Hybrid Cross Fusion: Spatial Attention (WHERE) + Channel Gating (WHAT)
-    - Final: Second SSM, upsampling, multi-head outputs
-    
-    Args:
-        input_shape: Input image shape (H, W, C)
-        features: List of features to predict
-        spatial_reduction: Spatial attention reduction ratio (default: 8)
-        channel_reduction: Channel gating reduction ratio (default: 4)
-    
-    Returns:
-        model: Keras Model
-        feature_outputs: Dictionary of output layers
-    """
-    
-    print("Building Hybrid Fusion Production Model...")
-    print(f"  Architecture:")
-    print(f"    - Reparam blocks (stable gradient flow)")
-    print(f"    - SSM blocks (global reasoning)")
-    print(f"    - Selective Pyramid (pool_sizes=[1,2,3])")
-    print(f"    - Hybrid Fusion (spatial={spatial_reduction}, channel={channel_reduction})")
-    
+        
     inputs = layers.Input(input_shape, name='input')
     
     # ========== STEM ==========
@@ -214,7 +355,6 @@ def build_hybrid_fusion_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
     x = layers.ReLU(name='stem_relu')(x)
     
     # ========== DETAIL BRANCH ==========
-    # Preserves fine-grained spatial information for point detection
     detail = layers.Conv2D(32, 3, padding='same',
                           kernel_initializer='he_normal', name='detail_conv')(x)
     detail = layers.BatchNormalization(name='detail_bn')(detail)
@@ -226,7 +366,6 @@ def build_hybrid_fusion_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
                                                block_id=f'detail_block_{i}')
     
     # ========== SEMANTIC BRANCH ==========
-    # Captures global context for region segmentation
     semantic = layers.Conv2D(64, 3, strides=2, padding='same',
                             kernel_initializer='he_normal', name='semantic_conv')(x)
     semantic = layers.BatchNormalization(name='semantic_bn')(semantic)
@@ -236,18 +375,14 @@ def build_hybrid_fusion_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
                                              training=True,
                                              block_id='semantic_1')
     
-    # ========== SSM BLOCK ==========
     semantic = ssm_v1_original(semantic, 96, 32, 'ssm_1')
     
-    # ========== SELECTIVE PYRAMID POOLING ==========
     semantic = SelectivePyramidPooling(
         filters=96, 
         pool_sizes=[1, 2, 3],
         preserve_detail=True,
         name='selective_pyramid'
     )(semantic)
-    
-    print("  ✓ Selective Pyramid: pool_sizes=[1,2,3]")
     
     # ========== CROSS-PATH CONNECTIONS ==========
     semantic_up = layers.Conv2DTranspose(32, 3, strides=2, padding='same',
@@ -265,15 +400,12 @@ def build_hybrid_fusion_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
     ), name='match_semantic_shape')([detail_down, semantic])
     
     # ========== HYBRID CROSS FUSION ==========
-    # Combines spatial attention (WHERE) + channel gating (WHAT)
     detail_fused, semantic_fused = HybridCrossFusion(
         spatial_reduction=spatial_reduction,
         channel_reduction=channel_reduction,
         use_residual=True,
         name='hybrid_fusion'
     )([detail, semantic, semantic_up, detail_down])
-    
-    print(f"  ✓ Hybrid Fusion: spatial_reduction={spatial_reduction}, channel_reduction={channel_reduction}")
     
     # ========== FINAL PROCESSING ==========
     detail_final = stable_reparameterizable_block(detail_fused, 48, stride=1,
@@ -283,7 +415,6 @@ def build_hybrid_fusion_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
                                                    training=True,
                                                    block_id='semantic_final')
     
-    # Second SSM block for additional semantic reasoning
     semantic_final = ssm_v1_original(semantic_final, 128, 48, 'ssm_2')
     
     # ========== UPSAMPLING ==========
@@ -310,131 +441,194 @@ def build_hybrid_fusion_model(input_shape=(256, 256, 3), features=ALL_FEATURES,
         x, [input_shape[0], input_shape[1]], method='bilinear'
     ), name='resize_final')(shared_features)
     
-    # ========== OUTPUT HEADS (one per feature) ==========
-    feature_outputs = create_optimized_feature_heads(shared_features, features)
-    
-    model = models.Model(inputs, list(feature_outputs.values()),
-                        name='HybridFusion_Production')
-    
-    # Set output names
-    for i, feature in enumerate(features):
-        model.output_names[i] = f'{feature}_output'
-    
-    print(f"  ✓ Model built: {model.count_params():,} parameters\n")
-    
-    return model, feature_outputs
-
-
-# ============================================================================
-# LOSS FUNCTIONS
-# ============================================================================
-
-def weighted_dice_loss(y_true, y_pred, class_weights):
-    """Weighted dice loss for imbalanced classes"""
-    y_true = tf.cast(y_true, tf.float32)
-    y_pred = tf.cast(y_pred, tf.float32)
-    
-    # Handle NaN values
-    y_pred = tf.where(tf.math.is_nan(y_pred), tf.zeros_like(y_pred), y_pred)
-    y_true = tf.where(tf.math.is_nan(y_true), tf.zeros_like(y_true), y_true)
-    
-    # Clip predictions for numerical stability
-    epsilon = tf.keras.backend.epsilon()
-    y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
-    
-    total_loss = 0.0
-    total_weight = tf.reduce_sum(class_weights)
-    
-    # Calculate dice for each class
-    for class_idx, weight in enumerate(class_weights):
-        y_true_class = y_true[..., class_idx]
-        y_pred_class = y_pred[..., class_idx]
-        
-        y_true_flat = tf.reshape(y_true_class, [-1])
-        y_pred_flat = tf.reshape(y_pred_class, [-1])
-        
-        intersection = tf.reduce_sum(y_true_flat * y_pred_flat)
-        union = tf.reduce_sum(y_true_flat) + tf.reduce_sum(y_pred_flat)
-        
-        dice = (2.0 * intersection + 1e-6) / (union + 1e-6)
-        dice = tf.where(tf.math.is_nan(dice), 0.0, dice)
-        dice = tf.clip_by_value(dice, 0.0, 1.0)
-        
-        total_loss += weight * (1.0 - dice)
-    
-    normalized_loss = total_loss / total_weight
-    normalized_loss = tf.where(tf.math.is_nan(normalized_loss), 1.0, normalized_loss)
-    
-    return tf.cast(normalized_loss, tf.float32)
-
-
-def create_loss_functions(features=ALL_FEATURES):
-    """Create loss functions for all features"""
-    losses = {}
-    loss_weights = {}
-    metrics = {}
+    # ========== OUTPUT HEADS ==========
+    outputs = []
+    output_names = []
     
     for feature in features:
-        output_name = f'{feature}_output'
+        feature_head = layers.Conv2D(16, 3, padding='same',
+                                    kernel_initializer='he_normal',
+                                    name=f'{feature}_head_conv')(shared_features)
+        feature_head = layers.BatchNormalization(name=f'{feature}_head_bn')(feature_head)
+        feature_head = layers.ReLU(name=f'{feature}_head_relu')(feature_head)
         
-        # Create dice loss with 1:20 class weights (background:foreground)
-        def create_dice_loss():
-            def loss_fn(y_true, y_pred):
-                return weighted_dice_loss(y_true, y_pred, [1.0, 20.0])
-            return loss_fn
-        
-        losses[output_name] = create_dice_loss()
-        loss_weights[output_name] = 1.0
-        metrics[output_name] = [dice_coefficient_metric, 'accuracy']
+        if feature in REGION_FEATURES:
+            # REGION: Binary mask only
+            mask = layers.Conv2D(2, 1, padding='same', activation='sigmoid',
+                                kernel_initializer='glorot_uniform',
+                                name=f'{feature}_mask')(feature_head)
+            outputs.append(mask)
+            output_names.append(f'{feature}_mask')
+            
+        elif feature in POINT_FEATURES:
+            # POINT: Heatmap + Coordinate
+            
+            # Heatmap output (FP16)
+            heatmap = layers.Conv2D(2, 1, padding='same', activation='sigmoid',
+                                   kernel_initializer='glorot_uniform',
+                                   name=f'{feature}_heatmap')(feature_head)
+            outputs.append(heatmap)
+            output_names.append(f'{feature}_heatmap')
+            
+            # Coordinate extraction (returns FP32)
+            coord_extractor = SoftArgmaxCoordinateExtractor(name=f'{feature}_coord_extractor')
+            coords = coord_extractor(heatmap)  # Handles FP16→FP32 internally
+            outputs.append(coords)
+            output_names.append(f'{feature}_coord')
     
-    return losses, loss_weights, metrics
+    # Create model
+    model = models.Model(inputs, outputs, name='DentScanNet_Complete_FIXED')
+    
+    for i, name in enumerate(output_names):
+        model.output_names[i] = name
+    
+
+    
+    return model, output_names
 
 
 # ============================================================================
-# TRAINING FUNCTION
+# LOSS CREATION (unchanged)
 # ============================================================================
 
-def train_hybrid_fusion(data_dir, output_dir, epochs=30, batch_size=4, 
-                       learning_rate=1e-4, seed=42,
-                       spatial_reduction=8, channel_reduction=4):
-    """
-    Train the Hybrid Fusion production model
+def create_complete_losses(output_names, loss_weights=None):
+    """Create losses matching manuscript"""
     
-    Args:
-        data_dir: Path to data directory (must contain train/ and test/)
-        output_dir: Output directory for results
-        epochs: Number of training epochs
-        batch_size: Batch size
-        learning_rate: Initial learning rate
-        seed: Random seed for reproducibility
-        spatial_reduction: Spatial attention reduction ratio
-        channel_reduction: Channel gating reduction ratio
+    if loss_weights is None:
+        loss_weights = {
+            'region': 1.0,
+            'heatmap': 1.0,
+            'coord': 0.5,
+        }
     
-    Returns:
-        Dictionary with training results
-    """
+    losses = {}
+    weights = {}
+    metrics = {}
     
-    print("="*80)
-    print(f"TRAINING HYBRID FUSION MODEL (Seed: {seed})")
-    print("="*80)
+    for output_name in output_names:
+        if '_mask' in output_name:
+            def create_region_loss():
+                def loss_fn(y_true, y_pred):
+                    return hybrid_dice_tversky_loss(y_true, y_pred,
+                                                   alpha=0.3, beta=0.7, gamma=1.5)
+                return loss_fn
+            
+            losses[output_name] = create_region_loss()
+            weights[output_name] = loss_weights['region']
+            metrics[output_name] = []
+            
+        elif '_heatmap' in output_name:
+            def create_heatmap_loss():
+                def loss_fn(y_true, y_pred):
+                    return online_hard_example_mining_focal_loss(y_true, y_pred,
+                                                                gamma=2.0, alpha=0.25,
+                                                                ohem_ratio=0.25, min_kept=100)
+                return loss_fn
+            
+            losses[output_name] = create_heatmap_loss()
+            weights[output_name] = loss_weights['heatmap']
+            metrics[output_name] = []
+            
+        elif '_coord' in output_name:
+            def create_coord_loss():
+                def loss_fn(y_true, y_pred):
+                    return huber_coordinate_loss(y_true, y_pred, delta=1.0)
+                return loss_fn
+            
+            losses[output_name] = create_coord_loss()
+            weights[output_name] = loss_weights['coord']
+            metrics[output_name] = []
     
-    # Set seeds
+    return losses, weights, metrics
+
+
+# ============================================================================
+# DATA LOADER (unchanged)
+# ============================================================================
+
+class ManuscriptConsistentDataLoader:
+    """Data loader that provides coordinates"""
+    
+    def __init__(self, base_loader):
+        self.base_loader = base_loader
+    
+    def __call__(self):
+        for batch in self.base_loader():
+            images, masks_list = batch
+            
+            targets = {}
+            
+            for i, feature in enumerate(ALL_FEATURES):
+                mask = masks_list[i]
+                
+                if feature in REGION_FEATURES:
+                    targets[f'{feature}_mask'] = mask
+                    
+                elif feature in POINT_FEATURES:
+                    targets[f'{feature}_heatmap'] = mask
+                    
+                    # Extract coordinates (FP32)
+                    coords = self.extract_coordinates_from_mask(mask)
+                    targets[f'{feature}_coord'] = coords
+            
+            yield images, targets
+    
+    @staticmethod
+    def extract_coordinates_from_mask(mask):
+        """Extract centroid from mask (returns FP32)"""
+        if len(mask.shape) == 4 and mask.shape[-1] == 2:
+            mask = mask[..., 1]
+        
+        batch_size = tf.shape(mask)[0]
+        height = tf.shape(mask)[1]
+        width = tf.shape(mask)[2]
+        
+        # All in float32
+        x_coords = tf.range(width, dtype=tf.float32)
+        y_coords = tf.range(height, dtype=tf.float32)
+        
+        x_grid = tf.tile(tf.reshape(x_coords, [1, 1, width]), [batch_size, height, 1])
+        y_grid = tf.tile(tf.reshape(y_coords, [1, height, 1]), [batch_size, 1, width])
+        
+        mask = tf.cast(mask, tf.float32)
+        total_mass = tf.reduce_sum(mask, axis=[1, 2]) + 1e-6
+        
+        x_center = tf.reduce_sum(mask * x_grid, axis=[1, 2]) / total_mass
+        y_center = tf.reduce_sum(mask * y_grid, axis=[1, 2]) / total_mass
+        
+        coords = tf.stack([x_center, y_center], axis=1)
+        
+        return coords
+
+
+# ============================================================================
+# TRAINING FUNCTION (same as before)
+# ============================================================================
+
+def train_complete_manuscript_model(data_dir, output_dir, epochs=30, batch_size=4,
+                                   learning_rate=1e-4, seed=42,
+                                   spatial_reduction=8, channel_reduction=4,
+                                   loss_weights=None):
+    """Train with COMPLETE manuscript-consistent implementation (FIXED)"""
+
+    
     np.random.seed(seed)
     tf.random.set_seed(seed)
     
     os.makedirs(output_dir, exist_ok=True)
     
     # Build model
-    model, _ = build_hybrid_fusion_model(
-        (IMAGE_HEIGHT, IMAGE_WIDTH, 3), 
+    model, output_names = build_complete_manuscript_model(
+        (IMAGE_HEIGHT, IMAGE_WIDTH, 3),
         ALL_FEATURES,
         spatial_reduction=spatial_reduction,
         channel_reduction=channel_reduction
     )
     
-    # Compile
-    losses, loss_weights, metrics = create_loss_functions(ALL_FEATURES)
+    # Create losses
+    losses, loss_weights_dict, metrics = create_complete_losses(output_names, loss_weights)
     
+    # Compile
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=learning_rate,
         beta_1=0.9,
@@ -447,40 +641,40 @@ def train_hybrid_fusion(data_dir, output_dir, epochs=30, batch_size=4,
     model.compile(
         optimizer=optimizer,
         loss=losses,
-        loss_weights=loss_weights,
+        loss_weights=loss_weights_dict,
         metrics=metrics
     )
     
-    print("\nModel compiled with:")
-    print(f"  Optimizer: Adam (lr={learning_rate}, clipnorm=1.0)")
-    print(f"  Loss: Weighted Dice (1:20 class weights)")
-    print(f"  Metrics: Dice coefficient, Accuracy\n")
+
     
     # Data loaders
     train_path = os.path.join(data_dir, 'train')
     test_path = os.path.join(data_dir, 'test')
     
-    print("Loading data...")
-    train_loader = OptimizedDataLoader(
+    print("\nLoading data...")
+    base_train_loader = OptimizedDataLoader(
         train_path, ALL_FEATURES, batch_size, (IMAGE_HEIGHT, IMAGE_WIDTH),
         enable_point_dilation=True, dilation_radius=4, is_training=True
     )
     
-    test_loader = OptimizedDataLoader(
+    base_test_loader = OptimizedDataLoader(
         test_path, ALL_FEATURES, batch_size, (IMAGE_HEIGHT, IMAGE_WIDTH),
         enable_point_dilation=True, dilation_radius=4, is_training=False
     )
     
-    train_steps = max(1, len(train_loader.image_files) // batch_size)
-    test_steps = max(1, len(test_loader.image_files) // batch_size)
+    train_loader = ManuscriptConsistentDataLoader(base_train_loader)
+    test_loader = ManuscriptConsistentDataLoader(base_test_loader)
     
-    print(f"  Train: {len(train_loader.image_files)} images ({train_steps} steps/epoch)")
-    print(f"  Test:  {len(test_loader.image_files)} images ({test_steps} steps/epoch)\n")
+    train_steps = max(1, len(base_train_loader.image_files) // batch_size)
+    test_steps = max(1, len(base_test_loader.image_files) // batch_size)
+    
+    print(f"  Train: {len(base_train_loader.image_files)} images ({train_steps} steps/epoch)")
+    print(f"  Test:  {len(base_test_loader.image_files)} images ({test_steps} steps/epoch)\n")
     
     # Callbacks
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(
-            os.path.join(output_dir, f'hybrid_fusion_best_seed{seed}.h5'),
+            os.path.join(output_dir, f'complete_best_seed{seed}.h5'),
             monitor='val_loss',
             save_best_only=True,
             mode='min',
@@ -504,11 +698,6 @@ def train_hybrid_fusion(data_dir, output_dir, epochs=30, batch_size=4,
         tf.keras.callbacks.CSVLogger(
             os.path.join(output_dir, f'training_log_seed{seed}.csv')
         ),
-        tf.keras.callbacks.TensorBoard(
-            log_dir=os.path.join(output_dir, f'logs_seed{seed}'),
-            histogram_freq=0,
-            write_graph=False
-        )
     ]
     
     # Train
@@ -534,249 +723,78 @@ def train_hybrid_fusion(data_dir, output_dir, epochs=30, batch_size=4,
     print("TRAINING COMPLETE")
     print("="*80)
     print(f"Total time: {training_time/3600:.2f} hours")
-    print(f"Epochs trained: {len(history.history['loss'])}")
-    
-    # Evaluate on test set
-    print("\nEvaluating on test set...")
-    results = model.evaluate(test_loader(), steps=test_steps, return_dict=True)
-    
-    # Extract metrics
-    feature_performance = {}
-    for feature in ALL_FEATURES:
-        dice_key = f'{feature}_output_dice_coefficient_metric'
-        if dice_key in results:
-            feature_performance[feature] = results[dice_key]
-    
-    avg_dice = np.mean(list(feature_performance.values()))
-    point_dice = np.mean([feature_performance[f] for f in POINT_FEATURES
-                         if f in feature_performance])
-    region_dice = np.mean([feature_performance[f] for f in REGION_FEATURES
-                          if f in feature_performance])
     
     # Save results
-    final_results = {
-        'model_name': 'hybrid_fusion_production',
+    results = {
+        'model_name': 'complete_manuscript_consistent_FIXED',
         'seed': seed,
-        'architecture': {
-            'fusion': 'HybridCrossFusion (Spatial Attention + Channel Gating)',
-            'spatial_reduction': spatial_reduction,
-            'channel_reduction': channel_reduction,
-            'pyramid': 'SelectivePyramidPooling (pool_sizes=[1,2,3])',
-            'reparam': 'Enabled',
-            'ssm': 'Enabled'
-        },
         'parameters': model.count_params(),
         'training_time_seconds': training_time,
         'epochs_trained': len(history.history['loss']),
         'final_train_loss': float(history.history['loss'][-1]),
         'final_val_loss': float(history.history['val_loss'][-1]),
-        
-        # Performance
-        'test_average_dice': float(avg_dice),
-        'test_point_dice': float(point_dice),
-        'test_region_dice': float(region_dice),
-        'test_feature_performance': {k: float(v) for k, v in feature_performance.items()},
-        
-        # Expected vs actual
-        'expected_overall': 76.67,
-        'expected_points': 77.18,
-        'expected_regions': 76.15,
-        'vs_baseline': {
-            'baseline_overall': 62.28,
-            'improvement_overall': float((avg_dice * 100) - 62.28),
-            'improvement_points': float((point_dice * 100) - 54.13),
-            'improvement_regions': float((region_dice * 100) - 70.43),
-        }
+        'dtype_fix': 'Applied - FP32 coordinates, FP16 masks/heatmaps'
     }
     
     results_path = os.path.join(output_dir, f'results_seed{seed}.json')
     with open(results_path, 'w') as f:
-        json.dump(final_results, f, indent=2)
+        json.dump(results, f, indent=2)
     
-    print(f"\n{'='*80}")
-    print("FINAL RESULTS")
-    print(f"{'='*80}")
-    print(f"Overall Dice: {avg_dice:.4f} ({avg_dice*100:.2f}%)")
-    print(f"Point Dice:   {point_dice:.4f} ({point_dice*100:.2f}%)")
-    print(f"Region Dice:  {region_dice:.4f} ({region_dice*100:.2f}%)")
-    print(f"\nImprovement vs Baseline:")
-    print(f"  Overall: {final_results['vs_baseline']['improvement_overall']:+.2f}%")
-    print(f"  Points:  {final_results['vs_baseline']['improvement_points']:+.2f}%")
-    print(f"  Regions: {final_results['vs_baseline']['improvement_regions']:+.2f}%")
     print(f"\nResults saved to: {results_path}")
-    print(f"Model saved to: {os.path.join(output_dir, f'hybrid_fusion_best_seed{seed}.h5')}")
-    print(f"{'='*80}\n")
     
-    # Cleanup
-    tf.keras.backend.clear_session()
-    del model
-    
-    return final_results
+    return results
 
 
 # ============================================================================
-# COMMAND LINE INTERFACE
+# CLI
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Train Hybrid Fusion Production Model',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-HYBRID FUSION - BEST PERFORMING ARCHITECTURE
-
-Combines:
-  • Spatial Attention (WHERE to fuse) - Learns pixel-level fusion decisions
-  • Channel Gating (WHAT to fuse) - Learns feature-level fusion decisions
-
-Expected Performance (based on test evaluation):
-  - Overall: ~76.67% (+14.39% vs baseline)
-  - Points:  ~77.18% (+23.05% vs baseline)
-  - Regions: ~76.15% (+5.72% vs baseline)
-
-Examples:
-
-  # Train with default settings
-  python train_hybrid_production.py \\
-      --data_dir "D:/Jokerst group/package2/combined_data2/processed" \\
-      --output_dir "./hybrid_fusion_production"
-
-  # Train multiple seeds for robust evaluation
-  python train_hybrid_production.py \\
-      --data_dir "./data" \\
-      --output_dir "./hybrid_fusion_multi_seed" \\
-      --seeds 42 123 456 \\
-      --epochs 30
-
-  # Custom fusion parameters
-  python train_hybrid_production.py \\
-      --data_dir "./data" \\
-      --output_dir "./hybrid_custom" \\
-      --spatial_reduction 16 \\
-      --channel_reduction 8 \\
-      --epochs 40
-        """
-    )
+    parser = argparse.ArgumentParser(description='Train COMPLETE Model (DTYPE FIXED)')
     
-    parser.add_argument('--data_dir', type=str, required=True,
-                       help='Path to data directory (must contain train/ and test/)')
-    parser.add_argument('--output_dir', type=str, required=True,
-                       help='Output directory for results')
-    parser.add_argument('--epochs', type=int, default=30,
-                       help='Number of epochs (default: 30)')
-    parser.add_argument('--batch_size', type=int, default=4,
-                       help='Batch size (default: 4)')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
-                       help='Learning rate (default: 1e-4)')
-    parser.add_argument('--seeds', type=int, nargs='+', default=[42],
-                       help='Random seeds (default: 42)')
-    parser.add_argument('--spatial_reduction', type=int, default=8,
-                       help='Spatial attention reduction ratio (default: 8)')
-    parser.add_argument('--channel_reduction', type=int, default=4,
-                       help='Channel gating reduction ratio (default: 4)')
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, required=True)
+    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--region_weight', type=float, default=1.0)
+    parser.add_argument('--heatmap_weight', type=float, default=1.0)
+    parser.add_argument('--coord_weight', type=float, default=0.5)
     
     args = parser.parse_args()
     
-    # Validate paths
-    if not os.path.exists(args.data_dir):
-        print(f"ERROR: Data directory not found: {args.data_dir}")
-        exit(1)
-    
-    train_dir = os.path.join(args.data_dir, 'train')
-    test_dir = os.path.join(args.data_dir, 'test')
-    
-    if not os.path.exists(train_dir):
-        print(f"ERROR: Train directory not found: {train_dir}")
-        exit(1)
-    if not os.path.exists(test_dir):
-        print(f"ERROR: Test directory not found: {test_dir}")
-        exit(1)
+    loss_weights = {
+        'region': args.region_weight,
+        'heatmap': args.heatmap_weight,
+        'coord': args.coord_weight,
+    }
     
     print("\n" + "="*80)
-    print("CONFIGURATION")
+    print("COMPLETE MANUSCRIPT-CONSISTENT TRAINING (DTYPE FIXED)")
     print("="*80)
-    print(f"Data directory: {args.data_dir}")
-    print(f"Output directory: {args.output_dir}")
-    print(f"Epochs: {args.epochs}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Learning rate: {args.learning_rate}")
-    print(f"Seeds: {args.seeds}")
-    print(f"Spatial reduction: {args.spatial_reduction}")
-    print(f"Channel reduction: {args.channel_reduction}")
+    print(f"Fix applied: Mixed precision dtype handling in soft_argmax")
+    print(f"Data: {args.data_dir}")
+    print(f"Output: {args.output_dir}")
     print("="*80)
     
-    input("\nPress Enter to start training...")
-    
-    # Train for each seed
-    all_results = []
-    
-    for seed in args.seeds:
-        try:
-            results = train_hybrid_fusion(
-                data_dir=args.data_dir,
-                output_dir=args.output_dir,
-                epochs=args.epochs,
-                batch_size=args.batch_size,
-                learning_rate=args.learning_rate,
-                seed=seed,
-                spatial_reduction=args.spatial_reduction,
-                channel_reduction=args.channel_reduction
-            )
-            all_results.append(results)
-            
-        except Exception as e:
-            print(f"\nERROR training seed {seed}: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    # Aggregate results if multiple seeds
-    if len(all_results) > 1:
-        print("\n" + "="*80)
-        print("AGGREGATE RESULTS (MULTIPLE SEEDS)")
-        print("="*80)
+    try:
+        results = train_complete_manuscript_model(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            seed=args.seed,
+            loss_weights=loss_weights
+        )
         
-        overall_scores = [r['test_average_dice'] * 100 for r in all_results]
-        point_scores = [r['test_point_dice'] * 100 for r in all_results]
-        region_scores = [r['test_region_dice'] * 100 for r in all_results]
+        print("\n✅ Training complete with dtype fix!")
         
-        print(f"Overall: {np.mean(overall_scores):.2f}% ± {np.std(overall_scores):.2f}%")
-        print(f"Points:  {np.mean(point_scores):.2f}% ± {np.std(point_scores):.2f}%")
-        print(f"Regions: {np.mean(region_scores):.2f}% ± {np.std(region_scores):.2f}%")
-        
-        # Save aggregate summary
-        aggregate_summary = {
-            'n_seeds': len(all_results),
-            'seeds': args.seeds,
-            'overall': {
-                'mean': float(np.mean(overall_scores)),
-                'std': float(np.std(overall_scores)),
-                'min': float(np.min(overall_scores)),
-                'max': float(np.max(overall_scores))
-            },
-            'points': {
-                'mean': float(np.mean(point_scores)),
-                'std': float(np.std(point_scores)),
-                'min': float(np.min(point_scores)),
-                'max': float(np.max(point_scores))
-            },
-            'regions': {
-                'mean': float(np.mean(region_scores)),
-                'std': float(np.std(region_scores)),
-                'min': float(np.min(region_scores)),
-                'max': float(np.max(region_scores))
-            },
-            'all_results': all_results
-        }
-        
-        summary_path = os.path.join(args.output_dir, 'aggregate_summary.json')
-        with open(summary_path, 'w') as f:
-            json.dump(aggregate_summary, f, indent=2)
-        
-        print(f"\nAggregate summary saved to: {summary_path}")
-        print("="*80)
-    
-    print("\n✅ Training complete!")
-    print(f"Results saved in: {args.output_dir}\n")
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == '__main__':
