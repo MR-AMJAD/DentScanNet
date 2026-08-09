@@ -12,7 +12,7 @@ IMAGE_WIDTH  = 256
 # Default pixel calibration for clinical measurements (iGH, iGR, iABL).
 # This value is system- and crop-specific and should be measured for your setup.
 # See README for calibration instructions.
-PIXELS_PER_MM = 27
+PIXELS_PER_MM = 37
 
 ALL_FEATURES = ['GM', 'CEJ', 'ABC', 'TOOTH', 'BONE', 'GINGIVA']
 POINT_FEATURES = ['GM', 'CEJ', 'ABC']
